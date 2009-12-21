@@ -1,0 +1,974 @@
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.PrintStream;
+
+/**
+ * Stos - a high-level forth machine on the JVM
+ * <p>
+ * This forth machine aims to be fairly complete while using only basic JVM 
+ * structure. It should run even on J2ME CLDC1.0/MIDP1.0 JVMs with little memory.
+ * <p>
+ * Note that almost all methods are private. This is because there is no need
+ * for accessing them in any way but for sending Forth code to the Stos Object's
+ * input, while making them private allows proGuard to optimize more aggressively.
+ * <p>
+ * TODO Create shared-memory (for messaging between multiple threads).<br>
+ * TODO Create a binary format for internal words, read from class resource.
+ * 
+ * @author Andre Bogus
+ */
+public final class Stos {
+	private static final int RET_STACK_SIZE = 64;
+	private static final int ARG_STACK_SIZE = 64;
+	private static final int VARS_SIZE = 1024;
+	private static final int WORDS_SIZE = 4096; // MUST BE <= WORD_MASK - INTERAL_SIZE
+	
+	private static final int WORD_MASK = 0xFFFF;
+	private static final int INITIAL_WORD_SIZE = 1024;
+	
+	/**
+	 * A flag telling the compiler to temporarily leave compiled mode.\n@see #ret\n@see #interpret
+	 */
+	private static final int MODE_IMMEDIATE = 1;
+	//private static final int MODE_HIDDEN = 2;
+	/**
+	 * A flag telling interpret that encountering this word in immediate mode is considered an error,\n@see #interpret
+	 */
+	private static final int MODE_COMPILE_ONLY = 4;
+		
+	private static final int INITIAL_BASE = 10; 
+
+	/*CONSTS*/
+
+	// Some predefined constants to push on the stack
+	private static final Short ONE = new Short((short)1);
+	private static final Short TWO = new Short((short)2);
+	private static final Short SIXTEEN = new Short((short)16);
+	private static final Short INTERNALS = new Short((short)INTERNAL_SIZE);
+	/**
+	 * An Integer Object with the value of -1, which represents truth in Forth.
+	 * Note that combining -1 with another word by <code>and</code>, it will leave the other word intact,
+	 * while combining FALSE with and will cancel it out to 0. Also note that TRUE equals (FALSE invert).
+	 * @see #FALSE
+	 * @see #and
+	 * @see #invert
+	 */
+	private static final Integer TRUE = new Integer(-1);
+	
+	/**
+	 * An Integer Object with the value of 0, which represents untruth in Forth.
+	 * Note that combining 0 with another word by <code>or</code>, it will leave the other word intact,
+	 * while combining TRUE with and will cancel it out to -1. Also note that FALSE equals (TRUE invert).
+	 * @see #TRUE
+	 * @see #or
+	 * @see #invert
+	 */
+	private static final Integer FALSE = new Integer(0);
+
+	private Object[] retStack;
+	private int retTop;
+	private int pc;
+
+	private Object[] argStack;
+	private int argTop;
+	
+	private Object[] vars;
+
+	/**
+	 * An array of word names. It gets initially filled with the contents of 
+	 * INTERNAL_NAMES and whenever a new word is created, its name is appended here.
+	 */
+	private String[] wordNames;
+
+	/**
+	 * An array of words. A word is a short array. The first short is for flags, the
+	 * others are either word addresses (if below INTERNAL_SIZE, of internal words,
+	 * else - minus INTERNAL_SIZE - of words) or in-line short/integer/string literals
+	 * @see #MODE_IMMEDIATE
+	 * @see #MODE_COMPILE_ONLY
+	 * @see #litstring_compile
+	 * @see #WORD_LITERALSHORT
+	 * @see #WORD_LITERALINT
+	 */
+	private short[][] words;
+
+	private InputStream in;
+	private PrintStream out;
+	private PrintStream err;
+
+	private static boolean debugMode = false;
+
+	/**
+	 * Start a Stos interpreter on the console
+	 */
+	public static void main(String[] args) {
+		new Stos(System.in, System.out, System.err).dostep(WORD_INTERPRET);
+	}
+	
+	/**
+	 * Formats a String for debugging.
+	 */
+	private String debugString(Object o) {
+		if (o == null) {
+			return "null";
+		} else if (o == vars) {
+			return "vars";
+		} else if (o == words) {
+			return "words";
+		} else if (o == wordNames) {
+			return "wordnames";
+		} else if (o == vars[NEW_WORD]) {
+			StringBuffer sb = new StringBuffer("{");
+			short[] arr = (short[])o;
+			for (int i = 0, l = getIntValue(vars[NEW_WORD_TOP]); i < l; i++) {
+				if (i > 0) sb.append(", ");
+				sb.append(String.valueOf(arr[i]));
+			}
+			sb.append("}");
+			return sb.toString();		
+		} else if (o instanceof short[]) {
+			StringBuffer sb = new StringBuffer("{");
+			short[] arr = (short[])o;
+			for (int i = 0; i < arr.length; i++) {
+				if (i > 0) sb.append(", ");
+				sb.append(String.valueOf(arr[i]));
+			}
+			sb.append("}");
+			return sb.toString();
+		} else {
+			return o.toString();
+		}
+	}
+
+	/**
+	 * Public copy constructor.
+	 * Will copy only the in, out, err, words and vars (the latter as a shallow copy).
+	 * The argstack and retstack will be empty.
+	 */
+	public Stos(Stos other) {
+		in = other.in;
+		out = other.out;
+		err = other.err;
+		
+		retStack = new Object[RET_STACK_SIZE];
+		retTop = 0;
+		pc = (WORD_INTERPRET << 16) + 1;
+
+		argStack = new Object[ARG_STACK_SIZE];
+		argTop = 0;
+
+		vars = new Object[VARS_SIZE];
+		System.arraycopy(other.vars, 0, vars, 0, getIntValue(other.vars[VAR_TOP]));
+		vars[NEW_WORD] = new short[INITIAL_WORD_SIZE];
+
+		wordNames = other.wordNames;
+		words = other.words;
+	}
+
+	/**
+	 * Creates a Stos interpreter with the given IO Streams.
+	 * @param i  An InputStream to be read from.
+	 * @param o  A PrintStream to write output to.
+	 * @param e  A PrintStream used for debugging- and error output.
+	 */
+	public Stos(InputStream i, PrintStream o, PrintStream e) {
+		in = i;
+		out = o;
+		err = e;
+		
+		retStack = new Object[RET_STACK_SIZE];
+		retTop = 0;
+		pc = (WORD_INTERPRET << 16) + 1;
+
+		argStack = new Object[ARG_STACK_SIZE];
+		argTop = 0;
+
+		int wordTop = INTERNAL_NAMES.length;
+
+		vars = new Object[VARS_SIZE];
+		vars[VAR_TOP] = new Integer(INITIAL_VAR_TOP);
+		vars[COMPILE_MODE] = FALSE; // used as boolean
+		vars[IMMEDIATE_FRAME] = TRUE; // -1
+		vars[BASE] = new Integer(INITIAL_BASE);
+		vars[NEW_WORD] = new short[INITIAL_WORD_SIZE];
+		vars[NEW_WORD_TOP] = FALSE; // 0
+		vars[WORD_TOP] = new Integer(wordTop);
+
+		wordNames = new String[wordTop + WORDS_SIZE];
+		System.arraycopy(INTERNAL_NAMES, 0, wordNames, 0, wordTop);
+		
+		words = new short[WORDS_SIZE][];
+		System.arraycopy(INTERNAL_WORDS, 0, words, 0, INTERNAL_WORDS.length);
+	}
+
+	/**
+	 * Pushes an Object on the arg stack.
+	 * @param o  The Object to push
+	 */
+	private void push(Object o) {
+		argStack[argTop++] = o;
+	}
+	
+	/**
+	 * Pops an Object off the arg stack.
+	 * @returns  The top Object from the stack.
+	 */
+	private Object pop() {
+		Object result = argStack[--argTop];
+		argStack[argTop] = null;
+		return result;
+	}
+
+	/**
+	 * Get an element from the arg stack. Does not change the top.
+	 * @param i  The position on the arg stack, starting from top.
+	 * @returns  The object from the arg stack at position i.
+	 */
+	private Object peek(int i) {
+		return argStack[argTop - 1 - i];
+	}
+
+	/**
+	 * Overwrite an element on the arg stack.
+	 * @param i  The position on the arg stack, starting from top.
+	 * @param o  The object to overwrite the top of the arg stack with.
+	 */	 
+	private void poke(int i, Object o) {
+		argStack[argTop - 1 - i] = o;
+	}
+	
+	/**
+	 * Pushes an Object on the ret stack.
+	 * @param o  The Object to push
+	 */
+	private void rpush(Object o) {
+		retStack[retTop++] = o;
+	}
+	
+	/**
+	 * Pops an Object off the ret stack.
+	 * @returns  The top Object from the stack.
+	 */
+	private Object rpop() {
+		Object result = retStack[--retTop];
+		retStack[retTop] = null;
+		return result;
+	}
+
+	/**
+	 * Get an element from the ret stack. Does not change the top.
+	 * @param i  The position on the ret stack, starting from top.
+	 * @returns  The object from the ret stack at position i.
+	 */
+	private Object rpeek(int i) {
+		return retStack[retTop - 1 - i];
+	}
+
+	/**
+	 * Overwrite an element on the ret stack.
+	 * @param i  The position on the ret stack, starting from top.
+	 * @param o  The object to overwrite the top of the arg stack with.
+	 */	 
+	private void rpoke(int i, Object o) {
+		retStack[retTop - 1 - i] = o;
+	}
+	
+	/**
+	 * Computes if we need to go up on the return stack. As we do not have a NEXT word,
+	 * we just return once we run over the end of a word array.
+	 */
+	private boolean mustReturn() {
+		if (pc < 65536) return false;
+		int w = (pc >>> 16) - INTERNAL_SIZE;
+		return w < 0 || w < ((Integer)vars[WORD_TOP]).intValue() && 
+			(pc & WORD_MASK) >= words[w].length;
+	}
+
+	/**
+	 * Sets the pc to the next viable word address. If we fall off the end of a word,
+	 * we go up the call stack using ret.
+	 * @see #mustReturn
+	 * @see #ret
+	 */
+	private void next() {
+		pc++;
+		while (mustReturn()) {
+			ret();
+		}
+	}
+
+	/**
+	 * Goes up the stack. Also handles the immediate-frame - if the Stos leaves the
+	 * highest immediate word on the return stack, the immediate frame is set to -1, thus
+	 * leaving the effective immediate mode if it happened to be in compile mode.
+	 */
+	private void ret() {
+		int immediate = ((Integer)vars[IMMEDIATE_FRAME]).intValue();
+		if (retTop == immediate) {
+			vars[IMMEDIATE_FRAME] = TRUE; // Clear immediate w/ -1
+		}
+		pc = (retTop <= 0) ? 0 : ((Integer)rpop()).intValue() + 1;
+	}
+
+	/**
+	 * Stores the address of the next position in the current word on the return stack
+	 * and sets the pc up to call the content of the current position on the next dostep
+	 * call. Its contents will then be executed until it is exhausted, upon which ret
+	 * fetches the next word address from the return stack.
+	 * @see #dostep
+	 * @see #ret
+	 * @see #interpret
+	 */
+	private void docol(short w) {
+		int word = pc >>> 16;
+		if (word < INTERNAL_SIZE) {
+			pc = (int)w << 16;
+		} else {
+			rpush(new Integer(pc));
+			pc = (int)((words[word - INTERNAL_SIZE][pc & WORD_MASK]) << 16);
+		}
+	}
+
+	private void debug(short word) {
+		for (int i = 0; i < retTop; i++) err.print(".");
+		err.print(wordNames[word] + "(");
+		for (int i = 0; i < argTop; i++) {
+			err.print(debugString(argStack[i]) + ' ');
+		}
+		err.println(")");
+	}
+
+	/**
+	 * evaluate a word
+	 * @params - the word to run
+	 */
+	 private void doword(int word, boolean d) {
+	 	if (word < INTERNAL_SIZE) {
+	 		if (d) debug((short)word);
+	 		dostep((short) word);
+	 		next();
+	 	} else {
+		 	int r = retTop;
+		 	pc = (word << 16) | 1;
+		 	do {
+		 		short w = words[(pc >>> 16) - INTERNAL_SIZE][pc & WORD_MASK];
+		 		if (d) debug(w);
+			 	dostep(w);
+			 	next();
+		 	} while (retTop >= r && pc > 65535);
+	 	}
+	 }
+
+	/**
+	 * Evaluate if the word at this position is an immediate word.
+	 * @param word - a short containing the index of the word.
+	 * @returns true if the word is set immediate. Note that internal words cannot be immediate.
+	 * @see #ret
+	 * @see #interpret
+	 */
+	private boolean isImmediate(short word) {
+		return word >= INTERNAL_SIZE && ((words[word - INTERNAL_SIZE][0] & MODE_IMMEDIATE) != 0);
+	}
+	
+	/**
+	 * Compare two Strings or numerical values on the argument stack with each other.
+	 * Removes one of the elements from the stack, leaving the other in place.
+	 * @returns  an int that is 0 if the elements are equal, 1 if the first element is
+	 * higher than the second, -1 else.
+	 */
+	private int compare() {
+		Object b = pop();
+		Object a = peek(0);
+		if (a instanceof String && b instanceof String) {
+			return ((String)b).compareTo((String)a);
+		} else {
+			return getIntValue(a) - getIntValue(b);
+		}
+	}
+	
+	/**
+	 * A so far quite stupid, but null-handling equals implementation.
+	 * This is known to fail on all kinds of arrays.
+	 */
+	private static boolean equals(Object a, Object b) {
+		if (a == null) return b == null;
+		if (a instanceof Short || a instanceof Integer) {
+			return (b instanceof Short || b instanceof Integer) && 
+				getIntValue(a) == getIntValue(b);
+		}
+		return a.equals(b);
+	}
+	
+	/**
+	 * Coerces a boolean value to an Integer following Forth semantics.
+	 * @see #TRUE
+	 * @see #FALSE
+	 */
+	private static Integer bool(boolean b) {
+		return b ? TRUE : FALSE;
+	}
+	
+	/**
+	 * Coerce the given Object into an integer, be it of type Integer, Short or Byte.
+	 * @param o  The value of which an Integer shall be created.
+	 * @throws ClassCastException if the given Object is not numeric.
+	 * @returns an int with the value of the given Object, if it is numeric
+	 * @see Integer
+	 * @see Short
+	 * @see Byte
+	 */
+	private static int getIntValue(Object o) {
+		if (o instanceof Integer)
+			return ((Integer)o).intValue();
+		if (o instanceof Short)
+			return ((Short)o).intValue();
+		if (o instanceof Byte)
+			return ((Byte)o).intValue();
+		String s;
+		if (o == null) s = "null"; else s = String.valueOf(o);
+		throw new ClassCastException("Not an integer: " + s);
+	}
+
+	/**
+	 * read a key from input (as defined by {@link #in})
+	 * @see #in
+	 */
+	private char getKey() {
+		try {
+			return Character.toChars(in.read())[0];
+		} catch (IOException e) {
+			return '\0';
+		}
+	}
+
+	/**
+	 * Reads a String from input (until encountering a &quot;) and returns it.
+	 * @returns the String read from stdin.
+	 * @see #litstring
+	 */
+	private String readLiteralString() {
+		StringBuffer sb = new StringBuffer();
+		while (true) {
+			char key = getKey();
+			if (key == '"') 
+				return sb.toString();
+			sb.append(key);
+		}
+	}
+	
+	/**
+	 * Pull out an inlined String given a word and position.
+	 * @param s The word (short[]) in which the string is inlined
+	 * @param index The index of the ." word (right before the inlined string)
+	 * @see #litstring_compile
+	 * @see #getstring
+	 */
+	private String unshorten(short[] s, int index) {
+		int len = (s[++index] >>> 8) & 0xff;
+		byte[] result = new byte[len];
+		for (int i = 0; i < len; i++) {
+			if ((i & 1) == 0)
+				result[i] = (byte)s[index++];
+			else
+				result[i] = (byte)(s[index] >>> 8);
+		}
+		return new String(result);
+	}
+	
+	/**
+	 * Computes the length of an inlined String in shorts.
+	 * @param word	The word containing an inlined String at
+	 * @param pos
+	 * @returns the number of shorts in the inlined String, so that <code>pos +
+	 * inlineWordLength(word, pos)</code> points to the first word after the String.
+	 */
+	private int inlineWordLength(short[] word, int pos) {
+		return ((word[pos + 1] >>> 9) & 127) + 1;
+	}
+	
+	/**
+	 * read predefined words from a stream. The format is as follows:
+	 * <pre>
+	 * +---+---+-- --+---+---+---+-- --+---+--
+	 * | n | name... | l |l/f| word... | n |
+	 * +---+---+-- --+---+---+---+-- --+---+--
+	 * </pre> where <ul>
+	 * <li>n (8 bits) = length of name in <code>byte</code>s.</li>
+	 * <li>name (n bytes) = the name of the word, 0-padded if n is odd.</li>
+	 * <li>l (13 bits) = length of the word in <code>short</code>s.</li>
+	 * <li>f (3 bits) = flags, where 1=immediate, 2=hidden, 4=compile-only.</li>
+	 * <li>word (l shorts) = the word (without flags, which are taken from f).</li>
+	 * </ul>
+	 * Note that the format of n:name is suitable for unshorten.
+	 * @see #unshorten
+	 * @see #MODE_IMMEDIATE
+	 * @see #MODE_HIDDEN
+	 * @see #MODE_COMPILE_ONLY
+	 */
+	/*private void readWords() throws IOException {
+		InputStream wordstream = getClass().getResourceAsStream("words");
+		byte[] buf = new byte[2];
+		short[] wbuf = new short[255];
+		int wptr = 0;
+		int len = -1;
+		boolean doName = true;
+		int wordIndex = 0;
+		while (wordstream.read(buf) > 1) {
+			wbuf[wptr] = (short)(buf[0] << 8 | (buf[1] & 0xff));
+			if (len < 0)
+				len = (doName ? inlineWordLength(wbuf, -1) : (int)wbuf[wptr] >>> 3);
+			if (wptr >= len) {
+				if (doName) {
+					wordNames[wordIndex + INTERNAL_SIZE] = unshorten(wbuf, -1);
+				} else {
+					short[] word = new short[len];
+					System.arraycopy(wbuf, 0, word, 0, len);
+					words[wordIndex++] = word;
+				}
+				doName = !doName;
+				wptr = 0;
+				len = -1;
+			}
+			wptr++;
+		}
+	}*/
+	
+	/**
+	 * Tells if the given char is a space character (e.g. space, tab, newline)
+	 * @param key  the character to analyze
+	 * @return true if key is either a space, tab, newline, CR or LF, false otherwise.
+	 */
+	private boolean isSpace(char key) {
+		return key == ' ' || key == '\t' || key == '\r' || key == '\n' || key == '\f';
+	}
+	
+	/**
+	 * Adds a value to the currently edited word. This puts the value in the vars[NEW_WORD] 
+	 * short array at position vars[NEW_WORD_TOP], which is subsequently incremented.
+	 * @params value the value to add.
+	 * @see #comma
+	 */
+	private void compileWord(short value) {
+		int top = getIntValue(vars[NEW_WORD_TOP]);
+		((short[])vars[NEW_WORD])[top] = value;
+		vars[NEW_WORD_TOP] = new Integer(top + 1);
+	}
+
+	/*CODE*/
+}
+========
+VAR_TOP
+COMPILE_MODE
+IMMEDIATE_FRAME
+BASE
+NEW_WORD
+NEW_WORD_TOP
+WORD_TOP
+========
+bye		A no-op placeholder; the interpreter will exit on encounter.\n@see #interpret
+	// Nothing to do here
+'1	pushone	Pushes a literal Short(1) on the stack. Should be in position one, so that '1 == ' '1.
+	push(ONE);
+'2	pushtwo	Pushes a literal Short(2) on the stack.
+	push(TWO);
+depth		( n0 ... nx - n0 ... nx x ) Push the size of the arg stack on the arg stack.
+	push(new Short((short)argTop));
+drop		( n - )
+	pop();
+swap		( a b - b a )\n<p>\nmultiple swaps cancel each other out.
+	Object a = pop();
+	Object b = pop();
+	push(a);
+	push(b);
+dup		( a - a a )
+	push(peek(0));
+over		( a b - a b a )
+	push(peek(1));
+rot		( a b c - b c a )\n@see #nrot
+	Object temp = peek(2);
+	poke(2, peek(1));
+	poke(1, peek(0));
+	poke(0, temp);
+-rot	nrot	( a b c - c a b ) the inverse of rot.\n@see #rot
+	Object temp = peek(0);
+	poke(0, peek(1));
+	poke(1, peek(2));
+	poke(2, temp);
+pick		( x0 ... xn n - x0 ... xn x0 ) Fetch the element at a position and replace the position with it.
+	poke(0, peek(getIntValue(peek(0))));
+2drop	twodrop	( a b - ) a shorthand for <code>drop drop</code>.\n@see #drop
+	pop();
+	pop();
+2dup	twodup	( a b - a b a b ) duplicates two fields on the stack. Caution: Not equal to <code>dup dup</code>.\n@see #dup
+	over();
+	over();
+2swap	twoswap	( a b c d - c d a b ) swaps the first two with the second two fields.\n@see #swap
+	Object temp = peek(0);
+	poke(0, peek(2));
+	poke(2, temp);
+	temp = peek(1);
+	poke(1, peek(3));
+	poke(3, temp);
+?dup	qdup	( 0 - 0; n - n n ) duplicate if not zero. Useful in conjunction with branch0. 
+	if (!FALSE.equals(peek(0)))
+		dup();
+1+	incr	( a - a+1 ) Increment the element on the stack. A shorthand for <code>'1 +</code>.
+	poke(0, new Integer(getIntValue(peek(0)) + 1));
+1-	decr	( a - a-1 ) Decrement the element on the stack. A shorthand for <code>'1 -</code>.
+	poke(0, new Integer(getIntValue(peek(0)) - 1));
++	add		( a b - a+b ) Add two elements.\nThe arguments need to be numeric, as defined by getIntValue. Note that integers can overflow on addition (for example <code>Integer.MAX_INT + Integer.MAX_INT</code>.\n@see #getIntValue
+	poke(0, new Integer(getIntValue(pop()) + getIntValue(peek(0))));
+*	multiply	( a b - a-b ) Multiply two elements.\nThe arguments need to be numeric, as defined by getIntValue.\nNote that integers can overflow on multiplication (for example <code>65536 * 65536</code>).\n@see #getIntValue
+	poke(0, new Integer(getIntValue(pop()) * getIntValue(peek(0))));
+-	subtract	( a b - a-b ) Subtract two elements.\nThe arguments need to be numeric, as defined by getIntValue.\nNote that integers can overflow on subtraction (for example <code>Integer.MAX_INT - Integer.MIN_INT</code>).\n@see #getIntValue\n@see Integer#MAX_VALUE\n@see Integer#MIN_VALUE
+	int temp = getIntValue(pop());
+	poke(0, new Integer(getIntValue(peek(0)) - temp));
+/	div	( a b - a/b ) Divide an element by another.\nThe arguments need to be numeric, as defined by getIntValue.\nNote that dividing by zero will throw an error.\n@see #getIntValue
+	int temp = getIntValue(pop());
+	poke(0, new Integer(getIntValue(peek(0)) / temp));
+mod			( a b - a <i>modulo</i> b ) Return the rest of a division of two elements.\nThe arguments need to be numeric, as defined by getIntValue..\n@see #getIntValue
+	int temp = getIntValue(pop());
+	poke(0, new Integer(getIntValue(peek(0)) % temp));
+false	pushfalse	( - FALSE ) Push FALSE on the stack.\n@see #FALSE
+	push(FALSE);
+true	pushtrue	( - TRUE ) Push TRUE on the stack.\n@see #TRUE
+	push(TRUE);
+null	pushnull	( - null ) Push null on the stack (for clearing fields)\n@see #store
+	push(null);
+=	equal	( a b - a=b ) If the elements are equal, replace them with TRUE, else with FALSE.\n@see #equals\n@see #TRUE\n@see #FALSE
+	poke(0, bool(equals(pop(), peek(0))));
+<>	nequal	( a b - a&ne;;b ) If the elements are unequal, replace them with TRUE, else with FALSE. A shorthand for <code>= not</code>.\n@see #equal\n@see #TRUE\n@see #FALSE
+	poke(0, bool(!equals(pop(), peek(0))));
+<	lowerthan	( a b - a&lt;b )\n@see #TRUE\n@see #FALSE
+	poke(0, bool(compare() < 0));
+>	greaterthan	( a b - a&gt;b )\n@see #TRUE\n@see #FALSE
+	poke(0, bool(compare() > 0));
+<=	lowerequal	( a b - a&le;b )\n@see #TRUE\n@see #FALSE
+	poke(0, bool(compare() <= 0));	
+>=	greaterequal	( a b - a&ge;b )\n@see #TRUE\n@see #FALSE
+	poke(0, bool(compare() >= 0));
+0=	equalzero	( a - a=0 )\nA shorthand for <code>0 =</code>.\n@see #equal
+	poke(0, bool(getIntValue(peek(0)) == 0));
+0<>	nequalzero	( a - a&ne;0 )\nA shorthand for <code>0 &lt;&gt;</code>.\n@see #nequal
+	poke(0, bool(getIntValue(peek(0)) != 0));
+0<	lowerzero ( a - a&lt;0 )\nA shorthand for <code>0 &lt;</code>.\n@see #lowerthan
+	poke(0, bool(getIntValue(peek(0)) < 0));
+0>	greaterzero ( a - a&gt;0 )\nA shorthand for <code>0 &gt;</code>.\n@see #greaterthan
+	poke(0, bool(getIntValue(peek(0)) > 0));
+0<=	lowerequalzero ( a - a&le;0 )\nA shorthand for <code>0 &le;=;</code>.\n@see #lowerequal
+	poke(0, bool(getIntValue(peek(0)) <= 0));
+0>=	greaterequalzero ( a - a&ge;0 )\nA shorthand for <code>0 &ge;=</code>.\n@see #greaterequal
+	poke(0, bool(getIntValue(peek(0)) >= 0));
+and		( a b - a&and;b ) Bitwise and\n@see #TRUE
+	poke(0, new Integer(getIntValue(pop()) & getIntValue(peek(0))));
+or		( a b - a&or;b ) Bitwise or\n@see #FALSE
+	poke(0, new Integer(getIntValue(pop()) | getIntValue(peek(0))));
+xor		( a b - a&otimes;b ) Bitwise xor
+	poke(0, new Integer(getIntValue(pop()) ^ getIntValue(peek(0))));
+not	invert	( a - &not;a ) Bitwise not
+	poke(0, new Integer(~getIntValue(peek(0))));
+u>> ushiftright ( a b - a >> b ) Shifts right a by b steps. Treats a as unsigned value. Requires 0 &le; b &lt; 32.
+	int temp = getIntValue(pop());
+	poke(0, new Integer(getIntValue(peek(0)) >>> temp));
+<<	shiftleft	(a b - a << b ) Shifts left a by b steps. Requires 0 &le; b &lt; 31. 
+	int temp = getIntValue(pop());
+	poke(0, new Integer(getIntValue(peek(0)) << temp));
+'16	push16	( - 16 ) Pushes a literal 16 on the stack
+	push(SIXTEEN);
+vars	variables	( - vars ) Pushes the heap on the argument stack.
+	/* legt das var-array auf dem Stack ab */
+	push(vars);
+wordnames		( - wordnames ) Pushes the array of word names on the argument stack.
+	/* legt das wordNames-array auf dem Stack ab */
+	push(wordNames);
+words		( - words ) Pushes the array of words (without predefined words) on the argument stack.\nNote that you can get the number of predefined words by <code>wordnames len words len -</code>\n@see #wordnames\n@see #len
+	/* legt das words-array auf dem Stack ab */
+	push(words);
+!	store	( a b c -> | b[c] = a ) Stores the value of a in the array b at address c. Note that b must be an array and c must be numeric as defined by getIntValue.\n@see #fetch\n@see #getIntValue
+	int pos = getIntValue(pop());
+	Object arr = pop();
+	Object val = pop();
+	if (arr instanceof short[]) { // need to be able to write to words
+		((short[])arr)[pos] = (short)getIntValue(val);	
+	} else {
+		((Object[])arr)[pos] = val;
+	}
+@	fetch	( a b - a[b] ) Fetches the value at the position b (numerical as defined by getIntValue) from the array a.\n@see #store\n@see #getIntValue
+	int pos = getIntValue(pop());
+	Object arr = peek(0);
+	if (arr instanceof short[]) {
+		poke(0, new Short(((short[])arr)[pos]));
+	} else {
+		poke(0, ((Object[])arr)[pos]);
+	}
++!	addstore	( a b c - | b[c] = b[c] + a ) Shorthand for a fetch add store operation. 
+	int pos = getIntValue(pop());
+	Object[] arr = (Object[])pop();
+	int val = getIntValue(pop());
+	arr[pos] = new Integer(getIntValue(arr[pos]) + val);
+-!	substore	( a b c - | b[c] = b[c] - a ) Shorthand for a fetch sub store operation.
+	int pos = getIntValue(pop());
+	Object[] arr = (Object[])pop();
+	int val = getIntValue(pop());
+	arr[pos] = new Integer(getIntValue(arr[pos]) - val);
+>r	tor	( a - | - a<sub>r</sub>) Moves the top element from the arg stack to the call stack.
+	rpush(pop());
+r>	fromr	( - a | a<sub>r</sub> - ) Moves the top element from the call stack to the arg stack.	
+	push(rpop());
+r@	rspfetch	( - a ) Fetches the top element from the call stack (without removing it).
+	push(rpeek(0));
+r!	rspstore	( a - | _<sub>r</sub> - a<sub>r</sub> ) Replaces the top element from the call stack with the top element from the arg stack. A shorthand for <code>rdrop &gt;r</code>
+	rpoke(0, pop());
+rdrop		( a<sub>r</sub> - ) Drops the top element from the call stack.
+	rpop();
+r#	rsppos	( - #r ) Pushes the size of the call stack on the arg stack.
+	push(new Short((short)retTop));
+getstring		( w p - w p+l s ) Given a word (as a short array) and the position of a litstring_compile operation, adds the short length to the position and push the string on the stack. Used for show1.\n@see #unshorten\n@see #inlineWordLength
+	short[] word = (short[])peek(1);
+	int pos = getIntValue(peek(0));
+	poke(0, new Integer(pos + inlineWordLength(word, pos)));
+	push(unshorten(word, pos));
+." litstring_compile	( - a ) Pushes a literal word on the stack that has been compiled to an inline word. Also jumps over the inline word data.\n@see #unshorten\n@see #inlineWordLength  
+	// this has been compiled to an inline word
+	short[] word = words[(pc >>> 16) - INTERNAL_SIZE];
+	int pos = pc & WORD_MASK;
+	push(unshorten(word, pos));
+	pc += inlineWordLength(word, pos);
+." litstring	( - a ) Reads a String literal from input and pushes it on the stack. If in compile mode, compiles a litstring_compile word plus inline string data.\n@see #in\n@see #readLiteralString\n@see #litstring_compile\n@see #compileWord\n@see #interpret
+	String s = readLiteralString();
+	if (FALSE.equals(vars[COMPILE_MODE])) {
+		push(s);
+	} else {
+		byte[] bytes = s.getBytes();
+		int len = bytes.length;
+		if (len > 255)
+			throw new IllegalArgumentException("String too long (" + len + " bytes)");
+		int temp = len;
+		compileWord(WORD_LITSTRING_COMPILE);
+		for (int i = 0, l = (len & -2) + 1; i < l; i++) {
+			if ((i & 1) == 0)
+				compileWord((short)(temp << 8 | (i == len ? 0 : (bytes[i] & 0xff))));
+			else
+				temp = bytes[i];
+		}		
+	}
+key		( - a ) Reads a Character from input.\n@see #in\n@see #getKey 
+	push(new Character(getKey()));
+.	emit	( a - ) Pops an Object from the arg stack and sends it to output.\n@see #out\n@see Object#toString()
+	out.print(debugString(pop()));
+	out.print(' ');
+.e	emiterr	( a - ) Pops an Object from the arg stack and sends it to error.\n@see #err\n@see Object#toString()
+	err.print(debugString(pop()));
+	err.print(' ');
+.s showstack	( - ) Shows the current contents of the stack as a nice debug view.\n@see #debugString
+	for (int i = 0; i < argTop; i++) {
+		out.print(debugString(argStack[i]));
+		out.print(' ');
+	}
+short[] shortarray	( len - short[len] ) Creates a short[] of the given length on the arg stack.
+	poke(0, new short[getIntValue(peek(0))]);
+arraycopy		( source target source-offs target-offs len - )\n@see System#arraycopy
+	int len = getIntValue(pop());
+	int toffset = getIntValue(pop());
+	int soffset = getIntValue(pop());
+	Object target = pop();
+	Object source = pop();
+	System.arraycopy(source, soffset, target, toffset, len);
+word		( - w ) Reads a space-delimited word and pushes it on the argument stack.\n@see #getKey\n@see #isSpace
+	StringBuffer sb = new StringBuffer();
+	char key;
+	do { key = getKey(); } while (isSpace(key)); // skip over spaces
+	while (key != '\0' && !isSpace(key)) {
+		sb.append(key);
+		key = getKey();
+	}
+	push(sb.toString());
+number		( s - a ) Reads a String from arg stack, parses to a number according to the current BASE.\n@see Integer#valueOf 
+	try {
+		int b = getIntValue(vars[BASE]);
+		poke(0, Integer.valueOf((String)peek(0), b));
+	} catch (NumberFormatException nfe) { // Default to what?
+		push(null);
+	}
+, comma		( a - ) Appends the argument to the current edited word.\n@see #compileWord
+	compileWord((short)getIntValue(pop()));
+len		( o - #o ) Given an array or String, replaces it with its length.\n@see String#length
+	/* if the element is an array or string, show the length */
+	Object o = peek(0);
+	if (o instanceof String) {
+		poke(0, ((String)o).length());
+	} else if (o instanceof Object[]) {
+		poke(0, ((Object[])o).length);
+	} else if (o instanceof short[]) {
+		poke(0, ((short[])o).length);
+	}
+debug	toggledebug	( ) Toggles debug mode, which when active writes a host of information to error.\n@see #err\n@see #debug
+	debugMode = !debugMode;
+call	call	( word - ? )
+	dostep((short)getIntValue(pop()));
+interpret		( ) Reads words from input and executes them.
+	/* TODO: move to forth */
+	int w = WORD_INTERPRET;
+	pc = (WORD_INTERPRET << 16) + 1;
+	while (w != WORD_BYE) {
+		word();
+		String word = (String)peek(0);
+		doword(WORD_FIND, false);
+		w = getIntValue(pop());
+		if (w >= 0) {	// found word
+			boolean interpretMode = FALSE.equals(vars[COMPILE_MODE]);
+			int immediate = ((Integer)vars[IMMEDIATE_FRAME]).intValue();
+			if (immediate == -1 && isImmediate((short)w)) {
+				immediate = retTop;
+				vars[IMMEDIATE_FRAME] = new Integer(retTop);
+			}
+		  	if (interpretMode || immediate != -1) {
+		  		try {
+					if (w > INTERNAL_SIZE && interpretMode &&
+			  				(words[w - INTERNAL_SIZE][0] & MODE_COMPILE_ONLY) != 0) {
+			  			// trying to run a compile-only word
+			  			err.println("The word " + wordNames[w] + " is compile-only.");
+			  		} else {
+						doword(w, debugMode);
+			  		}
+	  			} catch (Throwable t) {
+		  			t.printStackTrace(err);
+		  			debug((short)w);
+		  			while (argTop > 0) pop(); // clear stacks
+		  			while (retTop > 0) rpop();
+		  			argTop = retTop = 0;
+		  		}
+		  	} else { // compile
+		  		if (debugMode)
+		  			err.println("Compiling " + wordNames[w] + "(" + w + ")");
+		  		compileWord((short)w);
+		  		w = WORD_INTERPRET;
+		  	}
+		} else try { // literal number
+			int num = Integer.parseInt(word);
+			if (FALSE.equals(vars[COMPILE_MODE])) { // put on stack
+				push(new Integer(num));
+				if (debugMode) debug(WORD_LITERALINT);
+			} else if (num <= Short.MAX_VALUE && num >= Short.MIN_VALUE) { 
+				compileWord(WORD_LITERALSHORT);
+				compileWord((short)num);
+			} else { // compile a literal int
+				compileWord(WORD_LITERALINT);
+				compileWord((short)(num >>> 16));
+				compileWord((short)num);
+			}
+		} catch (NumberFormatException nfe) {
+			err.println("Word '" + word + "' not found.");
+		}
+	}
+#internal	internalsize	( - i ) Pushes INTERNAL_SIZE on the stack
+	push(INTERNALS);
+========
+: s@ ( b a - a[b] ) swap @ ;
+: tohi ( w - w << 16 ) '16 << ;
+: hiword ( w - w-u>>-16 ) '16 u>> ;
+: loword ( w - w&65535 ) tohi hiword ;
+: nip ( a b - b ) swap drop ;
+: tuck ( a b - b a b ) dup -rot ;
+: getword ( w - wth-word | internal only ) hiword #internal - words s@ ;
+: (getshort) HIDDEN ( r - s r+1 ) 1+ dup getword ( r word ) over loword @ swap ;
+: ." IMMEDIATE ( - s ) %litstring ( Must be IMMEDIATE, lest litstring-compile fails ) ;
+: (get-int) HIDDEN ( w r - w r+2 i ) 1+ 1+ 2dup loword 2dup 1- @ tohi -rot @ loword or ; 
+: int ( 'LITERALINT - i ) r> dup getword swap ( w r ) 
+	(get-int) ( w r+2 i ) -rot ( i w r+2 ) >r drop ;
+: ' ( 'LITERALSHORT - i ) r> (getshort) ( s r+1 ) >r 
+  ( CAUTION: Keep literalshort, branch ajd branch0 together, else (inline-short?) will not work. ) ;
+: branch ( - | branch to next short, see ' ) r> (getshort) ( s r+1 ) + >r ;
+: branch0 ( a - | branch if a=0 ) 0= r> (getshort) ( a=0 s r+1 ) -rot and + >r ;
+: roll ( n1 .. nx x - nx n1 ... nx-1 ) 
+  dup 0<= branch0 ELSE: drop branch END: :ELSE swap >r 1- recurse r> swap :END ; 
+: base ( n - | set base, as in 10 base ) $BASE ! ;
+: here ( - v ) $VAR_TOP @ ;
+: (minmax) HIDDEN branch0 OVER: swap :OVER drop ;
+: max ( a b - a b | if a>b, else - b a ) 2dup <= (minmax) ;
+: min ( a b - a b | if a<b, else - b a ) 2dup >= (minmax) ;
+: wordtop ( - w ) $WORD_TOP @ ;
+: (findlast) HIDDEN ( w c - n | n <= c, wordNames[n] = w )
+  :LOOP ( w c ) 1- dup 0>= branch0 END: 
+  2dup wordnames s@ ( w c w wordnames[c] ) = branch0 LOOP: :END nip ;
+: nextword ( - n ) $NEW_WORD @ ;
+: nextwordtop ( - n ) $NEW_WORD_TOP @ ;
+: (getflag) HIDDEN ( n f - w[n] f[n] f ) 
+  ( get flag f[n] of word n, leave one on the stack ) 
+  words rot #internal - @ ( f w[n] ) dup false @ rot ;
+: getflag ( n - w[n] f[n] ) false (getflag) drop ;
+: recurse IMMEDIATE COMPILE-ONLY ( - | compile a recursion ) wordtop , ;
+: tailrecurse IMMEDIATE COMPILE-ONLY ( - | compile tail recursion ) 
+  ' branch , false nextwordtop - , ;
+: find ( w - n | find last visible word w 'FIND )
+  wordtop ( w n=c )
+  :LOOP 2dup (findlast) nip ( w n ) dup #internal > branch0 INTERNAL:
+	( w n ) dup getflag ( w n w[n] f[n] ) nip '2 and 0= branch0 LOOP: ( w n ) 
+  :INTERNAL ( w n ) nip ;
+: findl ( w - n | find last word w, visible or not ) wordtop (findlast) ; 
+: setflag ( n f - | set flag f of word n ) (getflag) ( w[n] f[n] f ) or swap false ! ;
+: unsetflag ( n f - | clear flag f of word n ) (getflag) not and swap false ! ;
+: immediate IMMEDIATE ( make current word immediate ) '1 wordtop setflag ;
+: (hidden-flag) HIDDEN ( - wordtop 2 ) wordtop '2 ;
+: hidden ( - | hide current word ) (hidden-flag) setflag ;
+: unhide ( - | unhide current word ) (hidden-flag) unsetflag ;
+: create ( - | create new word entry ) wordnames wordtop ! 
+  nextword words wordtop #internal - ! hidden '1 $NEW_WORD_TOP ! ;
+: compile ( - | compile current word ) unhide nextwordtop short[] ( create word:short[N], where N=wordlength )
+  nextword over false false nextwordtop arraycopy ( - word ) 
+  words wordtop #internal - ! ( set words[wordtop - INTERNAL_SIZE]=word )
+  '1 $WORD_TOP +! ( increment word top ) false $NEW_WORD_TOP ! ( unset nextwordtop ) ;
+: defvar ( - | define variable, name from in ) word create vars , here , compile '1 $VAR_TOP +! ;
+: (set-compile-mode) HIDDEN $COMPILE_MODE ! ;
+: [ ( - | enter immediate mode ) IMMEDIATE false (set-compile-mode) ;
+: ] ( - | enter compiled mode ) true (set-compile-mode) ;
+: : ( - | start word definition ) word create ] ;
+: ; ( - | complete word definition ) IMMEDIATE compile [ ;
+: (see-word) ( p - | print word @ p ) wordnames s@ . ;
+: (see-num) ( word pos wp - word pos+1 word pos+1 ) debug drop 1+ 2dup debug ;
+: (within-words?) ( x - 0<=x<wordtop ) dup 0>= swap wordtop < and ;
+: (inline-short?) ( x - x='/branch/branch0 ) dup ( x x ) 
+  ' ' >= ( x x>=' ) swap ( x>' x ) ' branch0 <= ( x>' x<=branch0 ) and ;
+: .debug r# dup 0<= branch0 LOOP: drop wordnames ' interpret branch END: :LOOP ." " . 1- dup 0<> branch0 LOOP: drop ( indent )
+	wordnames r@ hiword @ . :END ." (" . .s ." )" . ;
+: (see) ( w p - w p' | see word entry, skip inlines )
+  2dup @ dup (within-words?) branch0 JUSTSHOW: dup (see-word) dup ' int = branch0 NOINT:
+  :ISINT drop (get-int) branch JUSTSHOW: :NOINT (inline-short?) branch0 END: 1+ 2dup @
+  :JUSTSHOW . :END ;
+: see ( decompile word ) ' : (see-word) word findl dup wordnames s@ . #internal - dup
+  0>= branch0 END: words s@ '1 
+  :LOOP (see) 1+ over len over <= branch0 LOOP: ( word n ) drop 
+  :END drop ' ; (see-word) ;
+: (ifcp) HIDDEN ( counter - | set nextword[counter] = nextwordtop-counter )
+   nextwordtop over - '2 - nextword rot 1+ ( nextwordtop-c nextword c ) ! ;
+: (ifstep) HIDDEN 1- nextword over @ ;
+: (compile-if) ( b - | compile b 0, for if and do ) , ' bye , ;
+: if IMMEDIATE COMPILE-ONLY ( p - | x? if <then-part> [ else <else-part> ] endif ) 
+  ' branch0 (compile-if) ;
+: else IMMEDIATE COMPILE-ONLY ( - | branch to endif ) ( add branch, retarget if-branch0 ) ' branch , ' 0 , 
+  nextwordtop ( c ) :LOOP (ifstep) 0= branch0 LOOP:
+  (ifstep) ' branch0 = branch0 LOOP: ( c ) (ifcp) ;
+: endif IMMEDIATE COMPILE-ONLY ( - | marker for if/else ) nextwordtop
+  :LOOP (ifstep) 0= branch0 LOOP: (ifstep) dup ' branch = swap ' branch0 = or branch0 LOOP:
+  ( counter ) (ifcp) ;
+: do ( - | start a do-until loop ) ( write a kind of noop ) IMMEDIATE COMPILE-ONLY 
+  ' branch (compile-if) ;
+: until IMMEDIATE COMPILE-ONLY ( p - | loop to "do" unless p ) nextwordtop 
+  :LOOP (ifstep) 0= branch0 LOOP: (ifstep) ' branch = branch0 LOOP: ( c ) 
+  dup dup nextword dup 2swap '2 + swap over nextwordtop swap -
+  ( c nextword nextword c+2 c nextwordtop-c ) arraycopy ( c ) '2 $NEW_WORD_TOP -!
+  ' branch0 , ( c ) nextwordtop - 1- , ;
+: while IMMEDIATE COMPILE-ONLY ( p - | loop to "do" while p ) ' 0= , until ;
+: catalog ( show all visible words ) false :LOOP dup #internal > branch0 INTERNAL:
+	words over #internal - @ false @ '2 and 0= branch0 HIDDEN:
+	:INTERNAL wordnames over @ . :HIDDEN 1+ dup wordtop >= branch0 LOOP: drop ;
+: (forgetword) HIDDEN ( wordnum - | delete word@wordnum to reclaim space ) 
+  dup null wordnames rot ! #internal - null words rot ! ;
+: forget ( - | forget all from word 'forget )
+  word find dup ' %forget > branch0 END: dup ( newtop c )
+  :LOOP dup (forgetword) 1+ dup wordtop > branch0 LOOP:
+  ( newtop c ) drop $WORD_TOP ! :END ;
+: (branch-compile) ( CAUTION: Do not use branch or branch0 after here! ) HIDDEN 
+  , word number , ;
+: branch IMMEDIATE COMPILE-ONLY ( - | compile branch ) ' branch (branch-compile) ;
+: branch0 IMMEDIATE COMPILE-ONLY ( - | compile branch0 ) ' branch0 (branch-compile) ;
