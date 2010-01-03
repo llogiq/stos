@@ -37,10 +37,12 @@ public class Internals {
 			throw new IllegalArgumentException("String too long (" + len + " bytes)");
 		int temp = len;
 		for (int i = 0, shortl = (len & -2) + 1; i < shortl; i++) {
-			if ((i & 1) == 0)
-				l.add(new Short((short)(temp << 8 | (i == len ? 0 : (bytes[i] & 0xff)))));
-			else
+			if ((i & 1) == 0) {
+				Short x = new Short((short)(temp << 8 | (i == len ? 0 : (bytes[i] & 0xff)))); 
+				l.add(x);
+			} else {
 				temp = bytes[i];
+			}
 		}
 	}
 		
@@ -181,8 +183,8 @@ public class Internals {
 						break; // allow for multiline words
 					}
 					String wordText = predefbuf.toString().trim();
-					String[] elems = wordText.split("\\s+", 3);
-					wordName = elems[1];
+					String[] elems = wordText.split("\\s", 3);
+					wordName = elems[1].trim();
 					if ("'".equals(wordName))
 						idxShort = new Short((short)wordConsts.size());
 					predefbuf.setLength(0);
@@ -198,8 +200,8 @@ public class Internals {
 					boolean firstComment = true;
 					predefwordComment.setLength(0);
 					while (true) {
-						elems = wordText.split("\\s+", 2);
-						String elem = elems[0];
+						elems = wordText.split("\\s", 2);
+						String elem = elems[0].trim();
 						if (elems.length < 2) break;
 						wordText = elems[1];
 						if ("".equals(elem) || elem == null)

@@ -78,7 +78,7 @@ public final class Stos {
 	 * An array of word names. It gets initially filled with the contents of 
 	 * INTERNAL_NAMES and whenever a new word is created, its name is appended here.
 	 */
-	private String[] wordNames;
+	private String[] names;
 
 	/**
 	 * An array of words. A word is a short array. The first short is for flags, the
@@ -90,7 +90,7 @@ public final class Stos {
 	 * @see #WORD_LITERALSHORT
 	 * @see #WORD_LITERALINT
 	 */
-	private short[][] words;
+	private short[][] defs;
 
 	private InputStream in;
 	private PrintStream out;
@@ -113,10 +113,10 @@ public final class Stos {
 			return "null";
 		} else if (o == vars) {
 			return "vars";
-		} else if (o == words) {
-			return "words";
-		} else if (o == wordNames) {
-			return "wordnames";
+		} else if (o == defs) {
+			return "defs";
+		} else if (o == names) {
+			return "names";
 		} else if (o == vars[NEW_WORD]) {
 			StringBuffer sb = new StringBuffer("{");
 			short[] arr = (short[])o;
@@ -161,8 +161,8 @@ public final class Stos {
 		System.arraycopy(other.vars, 0, vars, 0, getIntValue(other.vars[VAR_TOP]));
 		vars[NEW_WORD] = new short[INITIAL_WORD_SIZE];
 
-		wordNames = other.wordNames;
-		words = other.words;
+		names = other.names;
+		defs = other.defs;
 	}
 
 	/**
@@ -194,11 +194,11 @@ public final class Stos {
 		vars[NEW_WORD_TOP] = FALSE; // 0
 		vars[WORD_TOP] = new Integer(wordTop);
 
-		wordNames = new String[wordTop + WORDS_SIZE];
-		System.arraycopy(INTERNAL_NAMES, 0, wordNames, 0, wordTop);
+		names = new String[wordTop + WORDS_SIZE];
+		System.arraycopy(INTERNAL_NAMES, 0, names, 0, wordTop);
 		
-		words = new short[WORDS_SIZE][];
-		System.arraycopy(INTERNAL_WORDS, 0, words, 0, INTERNAL_WORDS.length);
+		defs = new short[WORDS_SIZE][];
+		System.arraycopy(INTERNAL_WORDS, 0, defs, 0, INTERNAL_WORDS.length);
 	}
 
 	/**
@@ -281,7 +281,7 @@ public final class Stos {
 		if (pc < 65536) return false;
 		int w = (pc >>> 16) - INTERNAL_SIZE;
 		return w < 0 || w < ((Integer)vars[WORD_TOP]).intValue() && 
-			(pc & WORD_MASK) >= words[w].length;
+			(pc & WORD_MASK) >= defs[w].length;
 	}
 
 	/**
@@ -325,13 +325,13 @@ public final class Stos {
 			pc = (int)w << 16;
 		} else {
 			rpush(new Integer(pc));
-			pc = (int)((words[word - INTERNAL_SIZE][pc & WORD_MASK]) << 16);
+			pc = (int)((defs[word - INTERNAL_SIZE][pc & WORD_MASK]) << 16);
 		}
 	}
 
 	private void debug(short word) {
 		for (int i = 0; i < retTop; i++) err.print(".");
-		err.print(wordNames[word] + "(");
+		err.print(names[word] + "(");
 		for (int i = 0; i < argTop; i++) {
 			err.print(debugString(argStack[i]) + ' ');
 		}
@@ -351,7 +351,7 @@ public final class Stos {
 		 	int r = retTop;
 		 	pc = (word << 16) | 1;
 		 	do {
-		 		short w = words[(pc >>> 16) - INTERNAL_SIZE][pc & WORD_MASK];
+		 		short w = defs[(pc >>> 16) - INTERNAL_SIZE][pc & WORD_MASK];
 		 		if (d) debug(w);
 			 	dostep(w);
 			 	next();
@@ -367,7 +367,7 @@ public final class Stos {
 	 * @see #interpret
 	 */
 	private boolean isImmediate(short word) {
-		return word >= INTERNAL_SIZE && ((words[word - INTERNAL_SIZE][0] & MODE_IMMEDIATE) != 0);
+		return word >= INTERNAL_SIZE && ((defs[word - INTERNAL_SIZE][0] & MODE_IMMEDIATE) != 0);
 	}
 	
 	/**
@@ -519,11 +519,11 @@ public final class Stos {
 				len = (doName ? inlineWordLength(wbuf, -1) : (int)wbuf[wptr] >>> 3);
 			if (wptr >= len) {
 				if (doName) {
-					wordNames[wordIndex + INTERNAL_SIZE] = unshorten(wbuf, -1);
+					names[wordIndex + INTERNAL_SIZE] = unshorten(wbuf, -1);
 				} else {
 					short[] word = new short[len];
 					System.arraycopy(wbuf, 0, word, 0, len);
-					words[wordIndex++] = word;
+					defs[wordIndex++] = word;
 				}
 				doName = !doName;
 				wptr = 0;
@@ -595,7 +595,7 @@ rot		( a b c - b c a )\n@see #nrot
 	poke(1, peek(2));
 	poke(2, temp);
 pick		( x0 ... xn n - x0 ... xn x0 ) Fetch the element at a position and replace the position with it.
-	poke(0, peek(getIntValue(peek(0))));
+	poke(0, peek(getIntValue(peek(0)) + 1));
 2drop	twodrop	( a b - ) a shorthand for <code>drop drop</code>.\n@see #drop
 	pop();
 	pop();
@@ -676,14 +676,13 @@ u>> ushiftright ( a b - a >> b ) Shifts right a by b steps. Treats a as unsigned
 '16	push16	( - 16 ) Pushes a literal 16 on the stack
 	push(SIXTEEN);
 vars	variables	( - vars ) Pushes the heap on the argument stack.
-	/* legt das var-array auf dem Stack ab */
 	push(vars);
-wordnames		( - wordnames ) Pushes the array of word names on the argument stack.
-	/* legt das wordNames-array auf dem Stack ab */
-	push(wordNames);
-words		( - words ) Pushes the array of words (without predefined words) on the argument stack.\nNote that you can get the number of predefined words by <code>wordnames len words len -</code>\n@see #wordnames\n@see #len
-	/* legt das words-array auf dem Stack ab */
-	push(words);
+names		( - names ) Pushes the array of word names on the argument stack.
+	push(names);
+defs		( - defs ) Pushes the array of word definitions (without predefined words) on the argument stack.\nNote that you can get the number of predefined words by <code>internal#</code> or <code>names len defs len -</code>\n@see #names\n@see #len\n@see #internalsize
+	push(defs);
+quot		( - "\"" ) Pushes a quotation mark on the argument stack.
+	push("\"");
 !	store	( a b c -> | b[c] = a ) Stores the value of a in the array b at address c. Note that b must be an array and c must be numeric as defined by getIntValue.\n@see #fetch\n@see #getIntValue
 	int pos = getIntValue(pop());
 	Object arr = pop();
@@ -730,13 +729,13 @@ getstring		( w p - w p+l s ) Given a word (as a short array) and the position of
 	push(unshorten(word, pos));
 ." litstring_compile	( - a ) Pushes a literal word on the stack that has been compiled to an inline word. Also jumps over the inline word data.\n@see #unshorten\n@see #inlineWordLength  
 	// this has been compiled to an inline word
-	short[] word = words[(pc >>> 16) - INTERNAL_SIZE];
+	short[] word = defs[(pc >>> 16) - INTERNAL_SIZE];
 	int pos = pc & WORD_MASK;
 	push(unshorten(word, pos));
 	pc += inlineWordLength(word, pos);
 ." litstring	( - a ) Reads a String literal from input and pushes it on the stack. If in compile mode, compiles a litstring_compile word plus inline string data.\n@see #in\n@see #readLiteralString\n@see #litstring_compile\n@see #compileWord\n@see #interpret
 	String s = readLiteralString();
-	if (FALSE.equals(vars[COMPILE_MODE])) {
+	if (FALSE.equals(vars[COMPILE_MODE]) || getIntValue(vars[IMMEDIATE_FRAME]) > -1) {
 		push(s);
 	} else {
 		byte[] bytes = s.getBytes();
@@ -754,19 +753,15 @@ getstring		( w p - w p+l s ) Given a word (as a short array) and the position of
 	}
 key		( - a ) Reads a Character from input.\n@see #in\n@see #getKey 
 	push(new Character(getKey()));
-.	emit	( a - ) Pops an Object from the arg stack and sends it to output.\n@see #out\n@see Object#toString()
+(.)	emit	( a - ) Pops an Object from the arg stack and sends it to output.\n@see #out\n@see Object#toString()
 	out.print(debugString(pop()));
-	out.print(' ');
 .e	emiterr	( a - ) Pops an Object from the arg stack and sends it to error.\n@see #err\n@see Object#toString()
 	err.print(debugString(pop()));
 	err.print(' ');
-.s showstack	( - ) Shows the current contents of the stack as a nice debug view.\n@see #debugString
-	for (int i = 0; i < argTop; i++) {
-		out.print(debugString(argStack[i]));
-		out.print(' ');
-	}
 short[] shortarray	( len - short[len] ) Creates a short[] of the given length on the arg stack.
 	poke(0, new short[getIntValue(peek(0))]);
+object[] objectarray ( len - Object[len] ) Creates an Object[] of the given length on the arg stack.
+	poke(0, new Object[getIntValue(peek(0))]);
 arraycopy		( source target source-offs target-offs len - )\n@see System#arraycopy
 	int len = getIntValue(pop());
 	int toffset = getIntValue(pop());
@@ -807,7 +802,7 @@ debug	toggledebug	( ) Toggles debug mode, which when active writes a host of inf
 call	call	( word - ? )
 	dostep((short)getIntValue(pop()));
 interpret		( ) Reads words from input and executes them.
-	/* TODO: move to forth */
+	/* TODO: move (partially) to forth */
 	int w = WORD_INTERPRET;
 	pc = (WORD_INTERPRET << 16) + 1;
 	while (w != WORD_BYE) {
@@ -825,9 +820,9 @@ interpret		( ) Reads words from input and executes them.
 		  	if (interpretMode || immediate != -1) {
 		  		try {
 					if (w > INTERNAL_SIZE && interpretMode &&
-			  				(words[w - INTERNAL_SIZE][0] & MODE_COMPILE_ONLY) != 0) {
+			  				(defs[w - INTERNAL_SIZE][0] & MODE_COMPILE_ONLY) != 0) {
 			  			// trying to run a compile-only word
-			  			err.println("The word " + wordNames[w] + " is compile-only.");
+			  			err.println("The word " + names[w] + " is compile-only.");
 			  		} else {
 						doword(w, debugMode);
 			  		}
@@ -840,7 +835,7 @@ interpret		( ) Reads words from input and executes them.
 		  		}
 		  	} else { // compile
 		  		if (debugMode)
-		  			err.println("Compiling " + wordNames[w] + "(" + w + ")");
+		  			err.println("Compiling " + names[w] + "(" + w + ")");
 		  		compileWord((short)w);
 		  		w = WORD_INTERPRET;
 		  	}
@@ -865,110 +860,114 @@ interpret		( ) Reads words from input and executes them.
 	push(INTERNALS);
 ========
 : s@ ( b a - a[b] ) swap @ ;
+: . ( w - emit an object + space ) (.) ."  " (.) ;
 : tohi ( w - w << 16 ) '16 << ;
 : hiword ( w - w-u>>-16 ) '16 u>> ;
 : loword ( w - w&65535 ) tohi hiword ;
 : nip ( a b - b ) swap drop ;
 : tuck ( a b - b a b ) dup -rot ;
-: getword ( w - wth-word | internal only ) hiword #internal - words s@ ;
-: (getshort) HIDDEN ( r - s r+1 ) 1+ dup getword ( r word ) over loword @ swap ;
+: wordat ( w - defs wth | for example getword = wordat @ ) defs swap  #internal - ;
+: getword ( w - wth-word | internal only ) wordat @ ;
+: gethiword ( w<<16 - wth-word | internal only ) HIDDEN hiword getword ;
+: (getshort) HIDDEN ( r - s r+1 ) 1+ dup gethiword ( r word ) over loword @ swap ;
 : ." IMMEDIATE ( - s ) %litstring ( Must be IMMEDIATE, lest litstring-compile fails ) ;
 : (get-int) HIDDEN ( w r - w r+2 i ) 1+ 1+ 2dup loword 2dup 1- @ tohi -rot @ loword or ; 
-: int ( 'LITERALINT - i ) r> dup getword swap ( w r ) 
-	(get-int) ( w r+2 i ) -rot ( i w r+2 ) >r drop ;
+: int ( 'LITERALINT - i ) r> dup gethiword swap ( w r ) 
+	 (get-int) ( w r+2 i ) -rot ( i w r+2 ) >r drop ;
 : ' ( 'LITERALSHORT - i ) r> (getshort) ( s r+1 ) >r 
-  ( CAUTION: Keep literalshort, branch ajd branch0 together, else (inline-short?) will not work. ) ;
+   ( CAUTION: Keep literalshort, branch and branch0 together, lest (inline-short?) fails. ) ;
 : branch ( - | branch to next short, see ' ) r> (getshort) ( s r+1 ) + >r ;
 : branch0 ( a - | branch if a=0 ) 0= r> (getshort) ( a=0 s r+1 ) -rot and + >r ;
 : roll ( n1 .. nx x - nx n1 ... nx-1 ) 
-  dup 0<= branch0 ELSE: drop branch END: :ELSE swap >r 1- recurse r> swap :END ; 
+   dup 0<= branch0 ELSE: drop branch END: :ELSE swap >r 1- recurse r> swap :END ; 
 : base ( n - | set base, as in 10 base ) $BASE ! ;
 : here ( - v ) $VAR_TOP @ ;
 : (minmax) HIDDEN branch0 OVER: swap :OVER drop ;
 : max ( a b - a b | if a>b, else - b a ) 2dup <= (minmax) ;
 : min ( a b - a b | if a<b, else - b a ) 2dup >= (minmax) ;
 : wordtop ( - w ) $WORD_TOP @ ;
-: (findlast) HIDDEN ( w c - n | n <= c, wordNames[n] = w )
-  :LOOP ( w c ) 1- dup 0>= branch0 END: 
-  2dup wordnames s@ ( w c w wordnames[c] ) = branch0 LOOP: :END nip ;
+: (findlast) HIDDEN ( w c - n | n <= c, names[n] = w )
+   :LOOP ( w c ) 1- dup 0>= branch0 END: 
+   2dup names s@ ( w c w names[c] ) = branch0 LOOP: :END nip ;
 : nextword ( - n ) $NEW_WORD @ ;
 : nextwordtop ( - n ) $NEW_WORD_TOP @ ;
-: (getflag) HIDDEN ( n f - w[n] f[n] f ) 
-  ( get flag f[n] of word n, leave one on the stack ) 
-  words rot #internal - @ ( f w[n] ) dup false @ rot ;
-: getflag ( n - w[n] f[n] ) false (getflag) drop ;
+: getflag ( n - w[n] f[n] ) getword dup false @ ;
 : recurse IMMEDIATE COMPILE-ONLY ( - | compile a recursion ) wordtop , ;
 : tailrecurse IMMEDIATE COMPILE-ONLY ( - | compile tail recursion ) 
-  ' branch , false nextwordtop - , ;
+   ' branch , false nextwordtop - , ;
 : find ( w - n | find last visible word w 'FIND )
-  wordtop ( w n=c )
-  :LOOP 2dup (findlast) nip ( w n ) dup #internal > branch0 INTERNAL:
-	( w n ) dup getflag ( w n w[n] f[n] ) nip '2 and 0= branch0 LOOP: ( w n ) 
-  :INTERNAL ( w n ) nip ;
+   wordtop ( w n=c )
+   :LOOP 2dup (findlast) nip ( w n ) dup #internal > branch0 INTERNAL:
+	 ( w n ) dup getflag ( w n w[n] f[n] ) nip '2 and 0= branch0 LOOP: ( w n ) 
+   :INTERNAL ( w n ) nip ;
 : findl ( w - n | find last word w, visible or not ) wordtop (findlast) ; 
-: setflag ( n f - | set flag f of word n ) (getflag) ( w[n] f[n] f ) or swap false ! ;
-: unsetflag ( n f - | clear flag f of word n ) (getflag) not and swap false ! ;
-: immediate IMMEDIATE ( make current word immediate ) '1 wordtop setflag ;
-: (hidden-flag) HIDDEN ( - wordtop 2 ) wordtop '2 ;
-: hidden ( - | hide current word ) (hidden-flag) setflag ;
-: unhide ( - | unhide current word ) (hidden-flag) unsetflag ;
-: create ( - | create new word entry ) wordnames wordtop ! 
-  nextword words wordtop #internal - ! hidden '1 $NEW_WORD_TOP ! ;
-: compile ( - | compile current word ) unhide nextwordtop short[] ( create word:short[N], where N=wordlength )
-  nextword over false false nextwordtop arraycopy ( - word ) 
-  words wordtop #internal - ! ( set words[wordtop - INTERNAL_SIZE]=word )
-  '1 $WORD_TOP +! ( increment word top ) false $NEW_WORD_TOP ! ( unset nextwordtop ) ;
+: setflag ( f n - | set flag f of word n ) getflag rot ( w[n] f[n] f ) or swap false ! ;
+: unsetflag ( f n - | clear flag f of word n ) getflag rot not and swap false ! ;
+: immediate IMMEDIATE ( make current word immediate ) wordtop '1 setflag ;
+: hidden ( - | hide current word ) '2 wordtop setflag ;
+: unhide ( - | unhide current word ) '2 wordtop unsetflag ;
+: create ( - | create new word entry ) names wordtop ! 
+   nextword wordtop wordat ! hidden '1 $NEW_WORD_TOP ! ; 
+: compile ( - | compile current word ) 
+   unhide   nextwordtop short[]   nextword over false dup nextwordtop arraycopy 
+   wordtop wordat !   '1 $WORD_TOP +!   false $NEW_WORD_TOP ! ;
 : defvar ( - | define variable, name from in ) word create vars , here , compile '1 $VAR_TOP +! ;
 : (set-compile-mode) HIDDEN $COMPILE_MODE ! ;
 : [ ( - | enter immediate mode ) IMMEDIATE false (set-compile-mode) ;
 : ] ( - | enter compiled mode ) true (set-compile-mode) ;
 : : ( - | start word definition ) word create ] ;
 : ; ( - | complete word definition ) IMMEDIATE compile [ ;
-: (see-word) ( p - | print word @ p ) wordnames s@ . ;
+: (see-word) ( p - | print word @ p ) names s@ . ;
 : (see-num) ( word pos wp - word pos+1 word pos+1 ) debug drop 1+ 2dup debug ;
 : (within-words?) ( x - 0<=x<wordtop ) dup 0>= swap wordtop < and ;
 : (inline-short?) ( x - x='/branch/branch0 ) dup ( x x ) 
-  ' ' >= ( x x>=' ) swap ( x>' x ) ' branch0 <= ( x>' x<=branch0 ) and ;
-: .debug r# dup 0<= branch0 LOOP: drop wordnames ' interpret branch END: :LOOP ." " . 1- dup 0<> branch0 LOOP: drop ( indent )
-	wordnames r@ hiword @ . :END ." (" . .s ." )" . ;
+   ' ' >= ( x x>=' ) swap ( x>' x ) ' branch0 <= ( x>' x<=branch0 ) and ;
+: indent ( n - | show n spaces ) dup 0<= branch0 E: :L ." " . 1- dup 0<> branch0 L: :E drop ;
+: .s ( - | show stack ) depth dup 0> branch0 E: :L dup pick . 1- dup 0<= branch0 L: :E drop ;
+: (debug) ( - | show debug info ) r# dup indent branch0 E:
+	  names r@ hiword @ . :E ." ( " . .s ." )" . ;
 : (see) ( w p - w p' | see word entry, skip inlines )
-  2dup @ dup (within-words?) branch0 JUSTSHOW: dup (see-word) dup ' int = branch0 NOINT:
-  :ISINT drop (get-int) branch JUSTSHOW: :NOINT (inline-short?) branch0 END: 1+ 2dup @
-  :JUSTSHOW . :END ;
-: see ( decompile word ) ' : (see-word) word findl dup wordnames s@ . #internal - dup
-  0>= branch0 END: words s@ '1 
-  :LOOP (see) 1+ over len over <= branch0 LOOP: ( word n ) drop 
-  :END drop ' ; (see-word) ;
+   2dup @ dup (within-words?) branch0 JUSTSHOW: 
+  	dup (see-word) 
+  	dup ' %litstring_compile = branch0 NOSTR:
+   :ISSTR drop getstring (.) quot branch JUSTSHOW:
+   :NOSTR dup ' int = branch0 NOINT:
+   :ISINT drop (get-int) branch JUSTSHOW: 
+   :NOINT (inline-short?) branch0 END: 1+ 2dup @
+   :JUSTSHOW . :END ;
+: see ( decompile word ) ' : (see-word)   word findl dup (see-word) #internal - dup
+   0>= branch0 END: 
+			defs s@ '1 :LOOP (see) 1+ over len over <= branch0 LOOP: ( word n ) drop 
+   :END drop ' ; (see-word) ;
 : (ifcp) HIDDEN ( counter - | set nextword[counter] = nextwordtop-counter )
    nextwordtop over - '2 - nextword rot 1+ ( nextwordtop-c nextword c ) ! ;
 : (ifstep) HIDDEN 1- nextword over @ ;
 : (compile-if) ( b - | compile b 0, for if and do ) , ' bye , ;
 : if IMMEDIATE COMPILE-ONLY ( p - | x? if <then-part> [ else <else-part> ] endif ) 
-  ' branch0 (compile-if) ;
+   ' branch0 (compile-if) ;
 : else IMMEDIATE COMPILE-ONLY ( - | branch to endif ) ( add branch, retarget if-branch0 ) ' branch , ' 0 , 
-  nextwordtop ( c ) :LOOP (ifstep) 0= branch0 LOOP:
-  (ifstep) ' branch0 = branch0 LOOP: ( c ) (ifcp) ;
+   nextwordtop ( c ) :LOOP (ifstep) 0= branch0 LOOP:
+   (ifstep) ' branch0 = branch0 LOOP: ( c ) (ifcp) ;
 : endif IMMEDIATE COMPILE-ONLY ( - | marker for if/else ) nextwordtop
-  :LOOP (ifstep) 0= branch0 LOOP: (ifstep) dup ' branch = swap ' branch0 = or branch0 LOOP:
-  ( counter ) (ifcp) ;
+   :LOOP (ifstep) 0= branch0 LOOP: (ifstep) dup ' branch = swap ' branch0 = or branch0 LOOP:
+   ( counter ) (ifcp) ;
 : do ( - | start a do-until loop ) ( write a kind of noop ) IMMEDIATE COMPILE-ONLY 
-  ' branch (compile-if) ;
+   ' branch (compile-if) ;
 : until IMMEDIATE COMPILE-ONLY ( p - | loop to "do" unless p ) nextwordtop 
-  :LOOP (ifstep) 0= branch0 LOOP: (ifstep) ' branch = branch0 LOOP: ( c ) 
-  dup dup nextword dup 2swap '2 + swap over nextwordtop swap -
-  ( c nextword nextword c+2 c nextwordtop-c ) arraycopy ( c ) '2 $NEW_WORD_TOP -!
-  ' branch0 , ( c ) nextwordtop - 1- , ;
+   :LOOP (ifstep) 0= branch0 LOOP: (ifstep) ' branch = branch0 LOOP: ( c ) 
+   dup dup nextword dup 2swap '2 + swap over nextwordtop swap -
+   ( c nextword nextword c+2 c nextwordtop-c ) arraycopy ( c ) '2 $NEW_WORD_TOP -!
+   ' branch0 , ( c ) nextwordtop - 1- , ;
 : while IMMEDIATE COMPILE-ONLY ( p - | loop to "do" while p ) ' 0= , until ;
-: catalog ( show all visible words ) false :LOOP dup #internal > branch0 INTERNAL:
-	words over #internal - @ false @ '2 and 0= branch0 HIDDEN:
-	:INTERNAL wordnames over @ . :HIDDEN 1+ dup wordtop >= branch0 LOOP: drop ;
+: words ( show all visible words ) false :LOOP dup #internal > branch0 INTERNAL:
+	 dup getword false @ '2 and 0= branch0 HIDDEN:
+	 :INTERNAL names over @ . :HIDDEN 1+ dup wordtop >= branch0 LOOP: drop ;
 : (forgetword) HIDDEN ( wordnum - | delete word@wordnum to reclaim space ) 
-  dup null wordnames rot ! #internal - null words rot ! ;
+   dup null names rot ! #internal - null defs rot ! ;
 : forget ( - | forget all from word 'forget )
-  word find dup ' %forget > branch0 END: dup ( newtop c )
-  :LOOP dup (forgetword) 1+ dup wordtop > branch0 LOOP:
-  ( newtop c ) drop $WORD_TOP ! :END ;
-: (branch-compile) ( CAUTION: Do not use branch or branch0 after here! ) HIDDEN 
-  , word number , ;
+   word find dup ' %forget > branch0 END: dup ( newtop c )
+   :LOOP dup (forgetword) 1+ dup wordtop > branch0 LOOP:
+   ( newtop c ) drop $WORD_TOP ! :END ;
+: (branch-compile) ( CAUTION: Do not use branch or branch0 after here! ) HIDDEN , word number , ;
 : branch IMMEDIATE COMPILE-ONLY ( - | compile branch ) ' branch (branch-compile) ;
 : branch0 IMMEDIATE COMPILE-ONLY ( - | compile branch0 ) ' branch0 (branch-compile) ;
